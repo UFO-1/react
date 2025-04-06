@@ -25,11 +25,12 @@ import type {
   PreinitScriptOptions,
   PreinitModuleScriptOptions,
 } from 'react-dom/src/shared/ReactDOMTypes';
-import type {TransitionTypes} from 'react/src/ReactTransitionType.js';
+import type {TransitionTypes} from 'react/src/ReactTransitionType';
 
 import {NotPending} from '../shared/ReactDOMFormActions';
 
 import {getCurrentRootHostContainer} from 'react-reconciler/src/ReactFiberHostContext';
+import {runWithFiberInDEV} from 'react-reconciler/src/ReactCurrentFiber';
 
 import hasOwnProperty from 'shared/hasOwnProperty';
 import {checkAttributeStringCoercion} from 'shared/CheckStringCoercion';
@@ -43,6 +44,8 @@ export {
 import {
   precacheFiberNode,
   updateFiberProps,
+  getFiberCurrentPropsFromNode,
+  getInstanceFromNode,
   getClosestInstanceFromNode,
   getFiberFromScopeInstance,
   getInstanceFromNode as getInstanceFromNodeDOMTree,
@@ -53,7 +56,10 @@ import {
   markNodeAsHoistable,
   isOwnedInstance,
 } from './ReactDOMComponentTree';
-import {traverseFragmentInstance} from 'react-reconciler/src/ReactFiberTreeReflection';
+import {
+  traverseFragmentInstance,
+  getFragmentParentHostInstance,
+} from 'react-reconciler/src/ReactFiberTreeReflection';
 
 export {detachDeletedInstance};
 import {hasRole} from './DOMAccessibilityRoles';
@@ -97,6 +103,7 @@ import {
   disableLegacyMode,
   enableMoveBefore,
   disableCommentsAsDOMContainers,
+  enableSuspenseyImages,
 } from 'shared/ReactFeatureFlags';
 import {
   HostComponent,
@@ -139,6 +146,10 @@ export type Props = {
   is?: string,
   size?: number,
   multiple?: boolean,
+  src?: string,
+  srcSet?: string,
+  loading?: 'eager' | 'lazy',
+  onLoad?: (event: any) => void,
   ...
 };
 type RawProps = {
@@ -763,9 +774,9 @@ export function commitMount(
       // only need to assign one. And Safari just never triggers a new load event which means this technique
       // is already a noop regardless of which properties are assigned. We should revisit if browsers update
       // this heuristic in the future.
-      if ((newProps: any).src) {
+      if (newProps.src) {
         ((domElement: any): HTMLImageElement).src = (newProps: any).src;
-      } else if ((newProps: any).srcSet) {
+      } else if (newProps.srcSet) {
         ((domElement: any): HTMLImageElement).srcset = (newProps: any).srcSet;
       }
       return;
@@ -818,10 +829,51 @@ export function appendChild(
   }
 }
 
+function warnForReactChildrenConflict(container: Container): void {
+  if (__DEV__) {
+    if ((container: any).__reactWarnedAboutChildrenConflict) {
+      return;
+    }
+    const props = getFiberCurrentPropsFromNode(container);
+    if (props !== null) {
+      const fiber = getInstanceFromNode(container);
+      if (fiber !== null) {
+        if (
+          typeof props.children === 'string' ||
+          typeof props.children === 'number'
+        ) {
+          (container: any).__reactWarnedAboutChildrenConflict = true;
+          // Run the warning with the Fiber of the container for context of where the children are specified.
+          // We could also maybe use the Portal. The current execution context is the child being added.
+          runWithFiberInDEV(fiber, () => {
+            console.error(
+              'Cannot use a ref on a React element as a container to `createRoot` or `createPortal` ' +
+                'if that element also sets "children" text content using React. It should be a leaf with no children. ' +
+                "Otherwise it's ambiguous which children should be used.",
+            );
+          });
+        } else if (props.dangerouslySetInnerHTML != null) {
+          (container: any).__reactWarnedAboutChildrenConflict = true;
+          runWithFiberInDEV(fiber, () => {
+            console.error(
+              'Cannot use a ref on a React element as a container to `createRoot` or `createPortal` ' +
+                'if that element also sets "dangerouslySetInnerHTML" using React. It should be a leaf with no children. ' +
+                "Otherwise it's ambiguous which children should be used.",
+            );
+          });
+        }
+      }
+    }
+  }
+}
+
 export function appendChildToContainer(
   container: Container,
   child: Instance | TextInstance,
 ): void {
+  if (__DEV__) {
+    warnForReactChildrenConflict(container);
+  }
   let parentNode: DocumentFragment | Element;
   if (container.nodeType === DOCUMENT_NODE) {
     parentNode = (container: any).body;
@@ -885,6 +937,9 @@ export function insertInContainerBefore(
   child: Instance | TextInstance,
   beforeChild: Instance | TextInstance | SuspenseInstance,
 ): void {
+  if (__DEV__) {
+    warnForReactChildrenConflict(container);
+  }
   let parentNode: DocumentFragment | Element;
   if (container.nodeType === DOCUMENT_NODE) {
     parentNode = (container: any).body;
@@ -1355,7 +1410,9 @@ export function cloneRootViewTransitionContainer(
 
   const containerParent = containerInstance.parentNode;
   if (containerParent === null) {
-    throw new Error('Cannot use a useSwipeTransition() in a detached root.');
+    throw new Error(
+      'Cannot use a startGestureTransition() on a detached root.',
+    );
   }
 
   const clone: HTMLElement = containerInstance.cloneNode(false);
@@ -1461,7 +1518,9 @@ export function removeRootViewTransitionClone(
   }
   const containerParent = containerInstance.parentNode;
   if (containerParent === null) {
-    throw new Error('Cannot use a useSwipeTransition() in a detached root.');
+    throw new Error(
+      'Cannot use a startGestureTransition() on a detached root.',
+    );
   }
   // We assume that the clone is still within the same parent.
   containerParent.removeChild(clone);
@@ -1477,10 +1536,12 @@ export type InstanceMeasurement = {
   view: boolean, // is in viewport bounds
 };
 
-export function measureInstance(instance: Instance): InstanceMeasurement {
-  const ownerWindow = instance.ownerDocument.defaultView;
-  const rect = instance.getBoundingClientRect();
-  const computedStyle = getComputedStyle(instance);
+function createMeasurement(
+  rect: ClientRect | DOMRect,
+  computedStyle: CSSStyleDeclaration,
+  element: Element,
+): InstanceMeasurement {
+  const ownerWindow = element.ownerDocument.defaultView;
   return {
     rect: rect,
     abs:
@@ -1506,6 +1567,26 @@ export function measureInstance(instance: Instance): InstanceMeasurement {
       rect.top <= ownerWindow.innerHeight &&
       rect.left <= ownerWindow.innerWidth,
   };
+}
+
+export function measureInstance(instance: Instance): InstanceMeasurement {
+  const rect = instance.getBoundingClientRect();
+  const computedStyle = getComputedStyle(instance);
+  return createMeasurement(rect, computedStyle, instance);
+}
+
+export function measureClonedInstance(instance: Instance): InstanceMeasurement {
+  const measuredRect = instance.getBoundingClientRect();
+  // Adjust the DOMRect based on the translate that put it outside the viewport.
+  // TODO: This might not be completely correct if the parent also has a transform.
+  const rect = new DOMRect(
+    measuredRect.x + 20000,
+    measuredRect.y + 20000,
+    measuredRect.width,
+    measuredRect.height,
+  );
+  const computedStyle = getComputedStyle(instance);
+  return createMeasurement(rect, computedStyle, instance);
 }
 
 export function wasInstanceInViewport(
@@ -1647,6 +1728,12 @@ function customizeViewTransitionError(
   return error;
 }
 
+/** @noinline */
+function forceLayout(ownerDocument: Document) {
+  // This function exists to trick minifiers to not remove this unused member expression.
+  return (ownerDocument.documentElement: any).clientHeight;
+}
+
 export function startViewTransition(
   rootContainer: Container,
   transitionTypes: null | TransitionTypes,
@@ -1656,7 +1743,7 @@ export function startViewTransition(
   spawnedWorkCallback: () => void,
   passiveCallback: () => mixed,
   errorCallback: mixed => void,
-): boolean {
+): null | RunningViewTransition {
   const ownerDocument: Document =
     rootContainer.nodeType === DOCUMENT_NODE
       ? (rootContainer: any)
@@ -1676,8 +1763,7 @@ export function startViewTransition(
         mutationCallback();
         if (previousFontLoadingStatus === 'loaded') {
           // Force layout calculation to trigger font loading.
-          // eslint-disable-next-line ft-flow/no-unused-expressions
-          (ownerDocument.documentElement: any).clientHeight;
+          forceLayout(ownerDocument);
           if (
             // $FlowFixMe[prop-missing]
             ownerDocument.fonts.status === 'loading'
@@ -1721,6 +1807,12 @@ export function startViewTransition(
         }
       } finally {
         // Continue the reset of the work.
+        // If the error happened in the snapshot phase before the update callback
+        // was invoked, then we need to first finish the mutation and layout phases.
+        // If they're already invoked it's still safe to call them due the status check.
+        mutationCallback();
+        layoutCallback();
+        // Skip afterMutationCallback() since we're not animating.
         spawnedWorkCallback();
       }
     };
@@ -1734,7 +1826,7 @@ export function startViewTransition(
       }
       passiveCallback();
     });
-    return true;
+    return transition;
   } catch (x) {
     // We use the error as feature detection.
     // The only thing that should throw is if startViewTransition is missing
@@ -1742,11 +1834,17 @@ export function startViewTransition(
     // I.e. it's before the View Transitions v2 spec. We only support View
     // Transitions v2 otherwise we fallback to not animating to ensure that
     // we're not animating with the wrong animation mapped.
-    return false;
+    // Flush remaining work synchronously.
+    mutationCallback();
+    layoutCallback();
+    // Skip afterMutationCallback(). We don't need it since we're not animating.
+    spawnedWorkCallback();
+    // Skip passiveCallback(). Spawned work will schedule a task.
+    return null;
   }
 }
 
-export type RunningGestureTransition = {
+export type RunningViewTransition = {
   skipTransition(): void,
   ...
 };
@@ -1840,6 +1938,7 @@ function animateGesture(
     // keyframe. Otherwise it applies to every keyframe.
     moveOldFrameIntoViewport(keyframes[0]);
   }
+  // TODO: Reverse the reverse if the original direction is reverse.
   const reverse = rangeStart > rangeEnd;
   targetElement.animate(keyframes, {
     pseudoElement: pseudoElement,
@@ -1850,7 +1949,7 @@ function animateGesture(
     // from scroll bouncing.
     easing: 'linear',
     // We fill in both direction for overscroll.
-    fill: 'both',
+    fill: 'both', // TODO: Should we preserve the fill instead?
     // We play all gestures in reverse, except if we're in reverse direction
     // in which case we need to play it in reverse of the reverse.
     direction: reverse ? 'normal' : 'reverse',
@@ -1870,12 +1969,16 @@ export function startGestureTransition(
   mutationCallback: () => void,
   animateCallback: () => void,
   errorCallback: mixed => void,
-): null | RunningGestureTransition {
+): null | RunningViewTransition {
   const ownerDocument: Document =
     rootContainer.nodeType === DOCUMENT_NODE
       ? (rootContainer: any)
       : rootContainer.ownerDocument;
   try {
+    // Force layout before we start the Transition. This works around a bug in Safari
+    // if one of the clones end up being a stylesheet that isn't loaded or uncached.
+    // https://bugs.webkit.org/show_bug.cgi?id=290146
+    forceLayout(ownerDocument);
     // $FlowFixMe[prop-missing]
     const transition = ownerDocument.startViewTransition({
       update: mutationCallback,
@@ -1891,18 +1994,33 @@ export function startGestureTransition(
       // up if they exist later.
       const foundGroups: Set<string> = new Set();
       const foundNews: Set<string> = new Set();
+      // Collect the longest duration of any view-transition animation including delay.
+      let longestDuration = 0;
       for (let i = 0; i < animations.length; i++) {
+        const effect: KeyframeEffect = (animations[i].effect: any);
         // $FlowFixMe
-        const pseudoElement: ?string = animations[i].effect.pseudoElement;
+        const pseudoElement: ?string = effect.pseudoElement;
         if (pseudoElement == null) {
-        } else if (pseudoElement.startsWith('::view-transition-group')) {
-          foundGroups.add(pseudoElement.slice(23));
-        } else if (pseudoElement.startsWith('::view-transition-new')) {
-          // TODO: This is not really a sufficient detection because if the new
-          // pseudo element might exist but have animations disabled on it.
-          foundNews.add(pseudoElement.slice(21));
+        } else if (pseudoElement.startsWith('::view-transition')) {
+          const timing = effect.getTiming();
+          const duration =
+            typeof timing.duration === 'number' ? timing.duration : 0;
+          // TODO: Consider interation count higher than 1.
+          const durationWithDelay = timing.delay + duration;
+          if (durationWithDelay > longestDuration) {
+            longestDuration = durationWithDelay;
+          }
+          if (pseudoElement.startsWith('::view-transition-group')) {
+            foundGroups.add(pseudoElement.slice(23));
+          } else if (pseudoElement.startsWith('::view-transition-new')) {
+            // TODO: This is not really a sufficient detection because if the new
+            // pseudo element might exist but have animations disabled on it.
+            foundNews.add(pseudoElement.slice(21));
+          }
         }
       }
+      const durationToRangeMultipler =
+        (rangeEnd - rangeStart) / longestDuration;
       for (let i = 0; i < animations.length; i++) {
         const anim = animations[i];
         if (anim.playState !== 'running') {
@@ -1942,14 +2060,33 @@ export function startGestureTransition(
             }
             // TODO: If this has only an old state and no new state,
           }
+          // Adjust the range based on how long the animation would've ran as time based.
+          // Since we're running animations in reverse from how they normally would run,
+          // therefore the timing is from the rangeEnd to the start.
+          const timing = effect.getTiming();
+          const duration =
+            typeof timing.duration === 'number' ? timing.duration : 0;
+          let adjustedRangeStart =
+            rangeEnd - (duration + timing.delay) * durationToRangeMultipler;
+          let adjustedRangeEnd =
+            rangeEnd - timing.delay * durationToRangeMultipler;
+          if (
+            timing.direction === 'reverse' ||
+            timing.direction === 'alternate-reverse'
+          ) {
+            // This animation was originally in reverse so we have to play it in flipped range.
+            const temp = adjustedRangeStart;
+            adjustedRangeStart = adjustedRangeEnd;
+            adjustedRangeEnd = temp;
+          }
           animateGesture(
             effect.getKeyframes(),
             // $FlowFixMe: Always documentElement atm.
             effect.target,
             pseudoElement,
             timeline,
-            rangeStart,
-            rangeEnd,
+            adjustedRangeStart,
+            adjustedRangeEnd,
             isGeneratedGroupAnim,
             isExitGroupAnim,
           );
@@ -2011,7 +2148,13 @@ export function startGestureTransition(
         }
       } finally {
         // Continue the reset of the work.
-        readyCallback();
+        // If the error happened in the snapshot phase before the update callback
+        // was invoked, then we need to first finish the mutation and layout phases.
+        // If they're already invoked it's still safe to call them due the status check.
+        mutationCallback();
+        // Skip readyCallback() and go straight to animateCallbck() since we're not animating.
+        // animateCallback() is still required to restore states.
+        animateCallback();
       }
     };
     transition.ready.then(readyForAnimations, handleError);
@@ -2038,13 +2181,14 @@ export function startGestureTransition(
   }
 }
 
-export function stopGestureTransition(transition: RunningGestureTransition) {
+export function stopViewTransition(transition: RunningViewTransition) {
   transition.skipTransition();
 }
 
 interface ViewTransitionPseudoElementType extends Animatable {
   _scope: HTMLElement;
   _selector: string;
+  getComputedStyle(): CSSStyleDeclaration;
 }
 
 function ViewTransitionPseudoElement(
@@ -2098,6 +2242,14 @@ ViewTransitionPseudoElement.prototype.getAnimations = function (
   }
   return result;
 };
+// $FlowFixMe[prop-missing]
+ViewTransitionPseudoElement.prototype.getComputedStyle = function (
+  this: ViewTransitionPseudoElementType,
+): CSSStyleDeclaration {
+  const scope = this._scope;
+  const selector = this._selector;
+  return getComputedStyle(scope, selector);
+};
 
 export function createViewTransitionInstance(
   name: string,
@@ -2123,60 +2275,6 @@ export function getCurrentGestureOffset(provider: GestureTimeline): number {
   return typeof time === 'number' ? time : time.value;
 }
 
-export function subscribeToGestureDirection(
-  provider: GestureTimeline,
-  currentOffset: number,
-  directionCallback: (direction: boolean) => void,
-): () => void {
-  if (
-    typeof ScrollTimeline === 'function' &&
-    provider instanceof ScrollTimeline
-  ) {
-    // For ScrollTimeline we optimize to only update the current time on scroll events.
-    const element = provider.source;
-    const scrollCallback = () => {
-      const newTime = provider.currentTime;
-      if (newTime !== null) {
-        const newValue = typeof newTime === 'number' ? newTime : newTime.value;
-        if (newValue !== currentOffset) {
-          directionCallback(newValue > currentOffset);
-        }
-      }
-    };
-    element.addEventListener('scroll', scrollCallback, false);
-    return () => {
-      element.removeEventListener('scroll', scrollCallback, false);
-    };
-  } else {
-    // For other AnimationTimelines, such as DocumentTimeline, we just update every rAF.
-    // TODO: Optimize ViewTimeline using an IntersectionObserver if it becomes common.
-    const rafCallback = () => {
-      const newTime = provider.currentTime;
-      if (newTime !== null) {
-        const newValue = typeof newTime === 'number' ? newTime : newTime.value;
-        if (newValue !== currentOffset) {
-          directionCallback(newValue > currentOffset);
-        }
-      }
-      callbackID = requestAnimationFrame(rafCallback);
-    };
-    let callbackID = requestAnimationFrame(rafCallback);
-    return () => {
-      cancelAnimationFrame(callbackID);
-    };
-  }
-}
-
-type EventListenerOptionsOrUseCapture =
-  | boolean
-  | {
-      capture?: boolean,
-      once?: boolean,
-      passive?: boolean,
-      signal?: AbortSignal,
-      ...
-    };
-
 type StoredEventListener = {
   type: string,
   listener: EventListener,
@@ -2186,6 +2284,7 @@ type StoredEventListener = {
 export type FragmentInstanceType = {
   _fragmentFiber: Fiber,
   _eventListeners: null | Array<StoredEventListener>,
+  _observers: null | Set<IntersectionObserver | ResizeObserver>,
   addEventListener(
     type: string,
     listener: EventListener,
@@ -2196,12 +2295,21 @@ export type FragmentInstanceType = {
     listener: EventListener,
     optionsOrUseCapture?: EventListenerOptionsOrUseCapture,
   ): void,
-  focus(): void,
+  focus(focusOptions?: FocusOptions): void,
+  focusLast(focusOptions?: FocusOptions): void,
+  blur(): void,
+  observeUsing(observer: IntersectionObserver | ResizeObserver): void,
+  unobserveUsing(observer: IntersectionObserver | ResizeObserver): void,
+  getClientRects(): Array<DOMRect>,
+  getRootNode(getRootNodeOptions?: {
+    composed: boolean,
+  }): Document | ShadowRoot | FragmentInstanceType,
 };
 
 function FragmentInstance(this: FragmentInstanceType, fragmentFiber: Fiber) {
   this._fragmentFiber = fragmentFiber;
   this._eventListeners = null;
+  this._observers = null;
 }
 // $FlowFixMe[prop-missing]
 FragmentInstance.prototype.addEventListener = function (
@@ -2281,8 +2389,124 @@ function removeEventListenerFromChild(
   return false;
 }
 // $FlowFixMe[prop-missing]
-FragmentInstance.prototype.focus = function (this: FragmentInstanceType) {
-  traverseFragmentInstance(this._fragmentFiber, setFocusIfFocusable);
+FragmentInstance.prototype.focus = function (
+  this: FragmentInstanceType,
+  focusOptions?: FocusOptions,
+): void {
+  traverseFragmentInstance(
+    this._fragmentFiber,
+    setFocusIfFocusable,
+    focusOptions,
+  );
+};
+// $FlowFixMe[prop-missing]
+FragmentInstance.prototype.focusLast = function (
+  this: FragmentInstanceType,
+  focusOptions?: FocusOptions,
+): void {
+  const children: Array<Instance> = [];
+  traverseFragmentInstance(this._fragmentFiber, collectChildren, children);
+  for (let i = children.length - 1; i >= 0; i--) {
+    const child = children[i];
+    if (setFocusIfFocusable(child, focusOptions)) {
+      break;
+    }
+  }
+};
+function collectChildren(
+  child: Instance,
+  collection: Array<Instance>,
+): boolean {
+  collection.push(child);
+  return false;
+}
+// $FlowFixMe[prop-missing]
+FragmentInstance.prototype.blur = function (this: FragmentInstanceType): void {
+  // TODO: When we have a parent element reference, we can skip traversal if the fragment's parent
+  //   does not contain document.activeElement
+  traverseFragmentInstance(
+    this._fragmentFiber,
+    blurActiveElementWithinFragment,
+  );
+};
+function blurActiveElementWithinFragment(child: Instance): boolean {
+  // TODO: We can get the activeElement from the parent outside of the loop when we have a reference.
+  const ownerDocument = child.ownerDocument;
+  if (child === ownerDocument.activeElement) {
+    // $FlowFixMe[prop-missing]
+    child.blur();
+    return true;
+  }
+  return false;
+}
+// $FlowFixMe[prop-missing]
+FragmentInstance.prototype.observeUsing = function (
+  this: FragmentInstanceType,
+  observer: IntersectionObserver | ResizeObserver,
+): void {
+  if (this._observers === null) {
+    this._observers = new Set();
+  }
+  this._observers.add(observer);
+  traverseFragmentInstance(this._fragmentFiber, observeChild, observer);
+};
+function observeChild(
+  child: Instance,
+  observer: IntersectionObserver | ResizeObserver,
+) {
+  observer.observe(child);
+  return false;
+}
+// $FlowFixMe[prop-missing]
+FragmentInstance.prototype.unobserveUsing = function (
+  this: FragmentInstanceType,
+  observer: IntersectionObserver | ResizeObserver,
+): void {
+  if (this._observers === null || !this._observers.has(observer)) {
+    if (__DEV__) {
+      console.error(
+        'You are calling unobserveUsing() with an observer that is not being observed with this fragment ' +
+          'instance. First attach the observer with observeUsing()',
+      );
+    }
+  } else {
+    this._observers.delete(observer);
+    traverseFragmentInstance(this._fragmentFiber, unobserveChild, observer);
+  }
+};
+function unobserveChild(
+  child: Instance,
+  observer: IntersectionObserver | ResizeObserver,
+) {
+  observer.unobserve(child);
+  return false;
+}
+// $FlowFixMe[prop-missing]
+FragmentInstance.prototype.getClientRects = function (
+  this: FragmentInstanceType,
+): Array<DOMRect> {
+  const rects: Array<DOMRect> = [];
+  traverseFragmentInstance(this._fragmentFiber, collectClientRects, rects);
+  return rects;
+};
+function collectClientRects(child: Instance, rects: Array<DOMRect>): boolean {
+  // $FlowFixMe[method-unbinding]
+  rects.push.apply(rects, child.getClientRects());
+  return false;
+}
+// $FlowFixMe[prop-missing]
+FragmentInstance.prototype.getRootNode = function (
+  this: FragmentInstanceType,
+  getRootNodeOptions?: {composed: boolean},
+): Document | ShadowRoot | FragmentInstanceType {
+  const parentHostInstance = getFragmentParentHostInstance(this._fragmentFiber);
+  if (parentHostInstance === null) {
+    return this;
+  }
+  const rootNode =
+    // $FlowFixMe[incompatible-cast] Flow expects Node
+    (parentHostInstance.getRootNode(getRootNodeOptions): Document | ShadowRoot);
+  return rootNode;
 };
 
 function normalizeListenerOptions(
@@ -2342,6 +2566,11 @@ export function commitNewChildToFragmentInstance(
       const {type, listener, optionsOrUseCapture} = eventListeners[i];
       childElement.addEventListener(type, listener, optionsOrUseCapture);
     }
+  }
+  if (fragmentInstance._observers !== null) {
+    fragmentInstance._observers.forEach(observer => {
+      observer.observe(childElement);
+    });
   }
 }
 
@@ -3117,7 +3346,10 @@ export function isHiddenSubtree(fiber: Fiber): boolean {
   return fiber.tag === HostComponent && fiber.memoizedProps.hidden === true;
 }
 
-export function setFocusIfFocusable(node: Instance): boolean {
+export function setFocusIfFocusable(
+  node: Instance,
+  focusOptions?: FocusOptions,
+): boolean {
   // The logic for determining if an element is focusable is kind of complex,
   // and since we want to actually change focus anyway- we can just skip it.
   // Instead we'll just listen for a "focus" event to verify that focus was set.
@@ -3133,7 +3365,7 @@ export function setFocusIfFocusable(node: Instance): boolean {
   try {
     element.addEventListener('focus', handleFocus);
     // $FlowFixMe[method-unbinding]
-    (element.focus || HTMLElement.prototype.focus).call(element);
+    (element.focus || HTMLElement.prototype.focus).call(element, focusOptions);
   } finally {
     element.removeEventListener('focus', handleFocus);
   }
@@ -4747,6 +4979,36 @@ export function isHostHoistableType(
 }
 
 export function maySuspendCommit(type: Type, props: Props): boolean {
+  if (!enableSuspenseyImages) {
+    return false;
+  }
+  // Suspensey images are the default, unless you opt-out of with either
+  // loading="lazy" or onLoad={...} which implies you're ok waiting.
+  return (
+    type === 'img' &&
+    props.src != null &&
+    props.src !== '' &&
+    props.onLoad == null &&
+    props.loading !== 'lazy'
+  );
+}
+
+export function maySuspendCommitOnUpdate(
+  type: Type,
+  oldProps: Props,
+  newProps: Props,
+): boolean {
+  return (
+    maySuspendCommit(type, newProps) &&
+    (newProps.src !== oldProps.src || newProps.srcSet !== oldProps.srcSet)
+  );
+}
+
+export function maySuspendCommitInSyncRender(
+  type: Type,
+  props: Props,
+): boolean {
+  // TODO: Allow sync lanes to suspend too with an opt-in.
   return false;
 }
 
@@ -4757,8 +5019,17 @@ export function mayResourceSuspendCommit(resource: Resource): boolean {
   );
 }
 
-export function preloadInstance(type: Type, props: Props): boolean {
-  return true;
+export function preloadInstance(
+  instance: Instance,
+  type: Type,
+  props: Props,
+): boolean {
+  // We don't need to preload Suspensey images because the browser will
+  // load them early once we set the src.
+  // If we return true here, we'll still get a suspendInstance call in the
+  // pre-commit phase to determine if we still need to decode the image or
+  // if was dropped from cache. This just avoids rendering Suspense fallback.
+  return !!(instance: any).complete;
 }
 
 export function preloadResource(resource: Resource): boolean {
@@ -4795,8 +5066,38 @@ export function startSuspendingCommit(): void {
   };
 }
 
-export function suspendInstance(type: Type, props: Props): void {
-  return;
+const SUSPENSEY_IMAGE_TIMEOUT = 500;
+
+export function suspendInstance(
+  instance: Instance,
+  type: Type,
+  props: Props,
+): void {
+  if (!enableSuspenseyImages) {
+    return;
+  }
+  if (suspendedState === null) {
+    throw new Error(
+      'Internal React Error: suspendedState null when it was expected to exists. Please report this as a React bug.',
+    );
+  }
+  const state = suspendedState;
+  if (
+    // $FlowFixMe[prop-missing]
+    typeof instance.decode === 'function' &&
+    typeof setTimeout === 'function'
+  ) {
+    // If this browser supports decode() API, we use it to suspend waiting on the image.
+    // The loading should have already started at this point, so it should be enough to
+    // just call decode() which should also wait for the data to finish loading.
+    state.count++;
+    const ping = onUnsuspend.bind(state);
+    Promise.race([
+      // $FlowFixMe[prop-missing]
+      instance.decode(),
+      new Promise(resolve => setTimeout(resolve, SUSPENSEY_IMAGE_TIMEOUT)),
+    ]).then(ping, ping);
+  }
 }
 
 export function suspendResource(

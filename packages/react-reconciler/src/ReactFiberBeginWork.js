@@ -33,7 +33,6 @@ import type {
   ViewTransitionState,
 } from './ReactFiberViewTransitionComponent';
 import {assignViewTransitionAutoName} from './ReactFiberViewTransitionComponent';
-import {OffscreenDetached} from './ReactFiberActivityComponent';
 import type {
   Cache,
   CacheComponentState,
@@ -77,6 +76,7 @@ import {
   TracingMarkerComponent,
   Throw,
   ViewTransitionComponent,
+  ActivityComponent,
 } from './ReactWorkTags';
 import {
   NoFlags,
@@ -322,6 +322,7 @@ export let didWarnAboutReassigningProps: boolean;
 let didWarnAboutRevealOrder;
 let didWarnAboutTailOptions;
 let didWarnAboutDefaultPropsOnFunctionComponent;
+let didWarnAboutClassNameOnViewTransition;
 
 if (__DEV__) {
   didWarnAboutBadClass = ({}: {[string]: boolean});
@@ -332,6 +333,7 @@ if (__DEV__) {
   didWarnAboutRevealOrder = ({}: {[empty]: boolean});
   didWarnAboutTailOptions = ({}: {[string]: boolean});
   didWarnAboutDefaultPropsOnFunctionComponent = ({}: {[string]: boolean});
+  didWarnAboutClassNameOnViewTransition = ({}: {[string]: boolean});
 }
 
 export function reconcileChildren(
@@ -646,19 +648,13 @@ function updateOffscreenComponent(
 ) {
   const nextProps: OffscreenProps = workInProgress.pendingProps;
   const nextChildren = nextProps.children;
-  const nextIsDetached =
-    (workInProgress.stateNode._pendingVisibility & OffscreenDetached) !== 0;
 
   const prevState: OffscreenState | null =
     current !== null ? current.memoizedState : null;
 
-  markRef(current, workInProgress);
-
   if (
     nextProps.mode === 'hidden' ||
-    (enableLegacyHidden &&
-      nextProps.mode === 'unstable-defer-without-hiding') ||
-    nextIsDetached
+    (enableLegacyHidden && nextProps.mode === 'unstable-defer-without-hiding')
   ) {
     // Rendering a hidden tree.
 
@@ -866,6 +862,46 @@ function deferHiddenOffscreenComponent(
 // ourselves to this constraint, though. If the behavior diverges, we should
 // fork the function.
 const updateLegacyHiddenComponent = updateOffscreenComponent;
+
+function updateActivityComponent(
+  current: null | Fiber,
+  workInProgress: Fiber,
+  renderLanes: Lanes,
+) {
+  const nextProps = workInProgress.pendingProps;
+  const nextChildren = nextProps.children;
+  const nextMode = nextProps.mode;
+  const mode = workInProgress.mode;
+  const offscreenChildProps: OffscreenProps = {
+    mode: nextMode,
+    children: nextChildren,
+  };
+
+  if (current === null) {
+    const primaryChildFragment = mountWorkInProgressOffscreenFiber(
+      offscreenChildProps,
+      mode,
+      renderLanes,
+    );
+    primaryChildFragment.ref = workInProgress.ref;
+    workInProgress.child = primaryChildFragment;
+    primaryChildFragment.return = workInProgress;
+
+    return primaryChildFragment;
+  } else {
+    const currentChild: Fiber = (current.child: any);
+
+    const primaryChildFragment = updateWorkInProgressOffscreenFiber(
+      currentChild,
+      offscreenChildProps,
+    );
+
+    primaryChildFragment.ref = workInProgress.ref;
+    workInProgress.child = primaryChildFragment;
+    primaryChildFragment.return = workInProgress;
+    return primaryChildFragment;
+  }
+}
 
 function updateCacheComponent(
   current: Fiber | null,
@@ -3257,6 +3293,28 @@ function updateViewTransition(
     // to client rendered content. If we don't end up using that we could just assign an incremeting
     // counter in the commit phase instead.
     assignViewTransitionAutoName(pendingProps, instance);
+    if (getIsHydrating()) {
+      pushMaterializedTreeId(workInProgress);
+    }
+  }
+  if (__DEV__) {
+    // $FlowFixMe[prop-missing]
+    if (pendingProps.className !== undefined) {
+      const example =
+        typeof pendingProps.className === 'string'
+          ? JSON.stringify(pendingProps.className)
+          : '{...}';
+      if (!didWarnAboutClassNameOnViewTransition[example]) {
+        didWarnAboutClassNameOnViewTransition[example] = true;
+        console.error(
+          '<ViewTransition> doesn\'t accept a "className" prop. It has been renamed to "default".\n' +
+            '-   <ViewTransition className=%s>\n' +
+            '+   <ViewTransition default=%s>',
+          example,
+          example,
+        );
+      }
+    }
   }
   if (current !== null && current.memoizedProps.name !== pendingProps.name) {
     // If the name changes, we schedule a ref effect to create a new ref instance.
@@ -4024,6 +4082,9 @@ function beginWork(
         return updateScopeComponent(current, workInProgress, renderLanes);
       }
       break;
+    }
+    case ActivityComponent: {
+      return updateActivityComponent(current, workInProgress, renderLanes);
     }
     case OffscreenComponent: {
       return updateOffscreenComponent(current, workInProgress, renderLanes);

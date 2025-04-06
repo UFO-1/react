@@ -40,7 +40,7 @@ export opaque type NoTimeout = mixed;
 export opaque type RendererInspectionConfig = mixed;
 export opaque type TransitionStatus = mixed;
 export opaque type FormInstance = mixed;
-export type RunningGestureTransition = mixed;
+export type RunningViewTransition = mixed;
 export type ViewTransitionInstance = null | {name: string, ...};
 export opaque type InstanceMeasurement = mixed;
 export type EventResponder = any;
@@ -88,6 +88,9 @@ export const shouldAttemptEagerTransition =
 export const detachDeletedInstance = $$$config.detachDeletedInstance;
 export const requestPostPaintCallback = $$$config.requestPostPaintCallback;
 export const maySuspendCommit = $$$config.maySuspendCommit;
+export const maySuspendCommitOnUpdate = $$$config.maySuspendCommitOnUpdate;
+export const maySuspendCommitInSyncRender =
+  $$$config.maySuspendCommitInSyncRender;
 export const preloadInstance = $$$config.preloadInstance;
 export const startSuspendingCommit = $$$config.startSuspendingCommit;
 export const suspendInstance = $$$config.suspendInstance;
@@ -149,15 +152,14 @@ export const cloneRootViewTransitionContainer =
 export const removeRootViewTransitionClone =
   $$$config.removeRootViewTransitionClone;
 export const measureInstance = $$$config.measureInstance;
+export const measureClonedInstance = $$$config.measureClonedInstance;
 export const wasInstanceInViewport = $$$config.wasInstanceInViewport;
 export const hasInstanceChanged = $$$config.hasInstanceChanged;
 export const hasInstanceAffectedParent = $$$config.hasInstanceAffectedParent;
 export const startViewTransition = $$$config.startViewTransition;
 export const startGestureTransition = $$$config.startGestureTransition;
-export const stopGestureTransition = $$$config.stopGestureTransition;
+export const stopViewTransition = $$$config.stopViewTransition;
 export const getCurrentGestureOffset = $$$config.getCurrentGestureOffset;
-export const subscribeToGestureDirection =
-  $$$config.subscribeToGestureDirection;
 export const createViewTransitionInstance =
   $$$config.createViewTransitionInstance;
 export const clearContainer = $$$config.clearContainer;

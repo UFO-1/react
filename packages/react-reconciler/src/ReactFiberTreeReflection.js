@@ -326,7 +326,7 @@ export function traverseFragmentInstance<A, B, C>(
   b: B,
   c: C,
 ): void {
-  return traverseFragmentInstanceChildren(fragmentFiber.child, fn, a, b, c);
+  traverseFragmentInstanceChildren(fragmentFiber.child, fn, a, b, c);
 }
 
 function traverseFragmentInstanceChildren<A, B, C>(
@@ -351,4 +351,19 @@ function traverseFragmentInstanceChildren<A, B, C>(
     }
     child = child.sibling;
   }
+}
+
+export function getFragmentParentHostInstance(fiber: Fiber): null | Instance {
+  let parent = fiber.return;
+  while (parent !== null) {
+    if (parent.tag === HostRoot) {
+      return parent.stateNode.containerInfo;
+    }
+    if (parent.tag === HostComponent) {
+      return parent.stateNode;
+    }
+    parent = parent.return;
+  }
+
+  return null;
 }

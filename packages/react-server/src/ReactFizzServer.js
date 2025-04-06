@@ -133,6 +133,7 @@ import {
   callRenderInDEV,
 } from './ReactFizzCallUserSpace';
 
+import {resetOwnerStackLimit} from 'shared/ReactOwnerStackReset';
 import {
   getIteratorFn,
   ASYNC_ITERATOR,
@@ -151,9 +152,9 @@ import {
   REACT_CONTEXT_TYPE,
   REACT_CONSUMER_TYPE,
   REACT_SCOPE_TYPE,
-  REACT_OFFSCREEN_TYPE,
   REACT_POSTPONE_TYPE,
   REACT_VIEW_TRANSITION_TYPE,
+  REACT_ACTIVITY_TYPE,
 } from 'shared/ReactSymbols';
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 import {
@@ -473,6 +474,10 @@ export function createRequest(
   onPostpone: void | ((reason: string, postponeInfo: PostponeInfo) => void),
   formState: void | null | ReactFormState<any, any>,
 ): Request {
+  if (__DEV__) {
+    resetOwnerStackLimit();
+  }
+
   // $FlowFixMe[invalid-constructor]: the shapes are exact here but Flow doesn't like constructors
   const request: Request = new RequestInstance(
     resumableState,
@@ -571,6 +576,10 @@ export function resumeRequest(
   onFatalError: void | ((error: mixed) => void),
   onPostpone: void | ((reason: string, postponeInfo: PostponeInfo) => void),
 ): Request {
+  if (__DEV__) {
+    resetOwnerStackLimit();
+  }
+
   // $FlowFixMe[invalid-constructor]: the shapes are exact here but Flow doesn't like constructors
   const request: Request = new RequestInstance(
     postponedState.resumableState,
@@ -2211,6 +2220,34 @@ function renderOffscreen(
   }
 }
 
+function renderViewTransition(
+  request: Request,
+  task: Task,
+  keyPath: KeyNode,
+  props: Object,
+) {
+  const prevKeyPath = task.keyPath;
+  task.keyPath = keyPath;
+  if (props.name != null && props.name !== 'auto') {
+    renderNodeDestructive(request, task, props.children, -1);
+  } else {
+    // This will be auto-assigned a name which claims a "useId" slot.
+    // This component materialized an id. We treat this as its own level, with
+    // a single "child" slot.
+    const prevTreeContext = task.treeContext;
+    const totalChildren = 1;
+    const index = 0;
+    // Modify the id context. Because we'll need to reset this if something
+    // suspends or errors, we'll use the non-destructive render path.
+    task.treeContext = pushTreeContext(prevTreeContext, totalChildren, index);
+    renderNode(request, task, props.children, -1);
+    // Like the other contexts, this does not need to be in a finally block
+    // because renderNode takes care of unwinding the stack.
+    task.treeContext = prevTreeContext;
+  }
+  task.keyPath = prevKeyPath;
+}
+
 function renderElement(
   request: Request,
   task: Task,
@@ -2253,7 +2290,7 @@ function renderElement(
       task.keyPath = prevKeyPath;
       return;
     }
-    case REACT_OFFSCREEN_TYPE: {
+    case REACT_ACTIVITY_TYPE: {
       renderOffscreen(request, task, keyPath, props);
       return;
     }
@@ -2267,10 +2304,7 @@ function renderElement(
     }
     case REACT_VIEW_TRANSITION_TYPE: {
       if (enableViewTransition) {
-        const prevKeyPath = task.keyPath;
-        task.keyPath = keyPath;
-        renderNodeDestructive(request, task, props.children, -1);
-        task.keyPath = prevKeyPath;
+        renderViewTransition(request, task, keyPath, props);
         return;
       }
       // Fallthrough
@@ -4591,6 +4625,7 @@ export function performWork(request: Request): void {
     fatalError(request, error, errorInfo, null);
   } finally {
     setCurrentResumableState(prevResumableState);
+
     ReactSharedInternals.H = prevDispatcher;
     ReactSharedInternals.A = prevAsyncDispatcher;
 
